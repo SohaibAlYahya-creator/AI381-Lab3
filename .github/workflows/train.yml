@@ -1,4 +1,4 @@
-# Lab 3, Part 5: train the candidates and run the promotion gate on every pull request and every push to main.
+# Lab 3, Part 5: train the candidates, run the promotion gate, then build, smoke-test and publish the champion image.
 # Red run = the gate blocked a model that is not good enough. That red run is what you show in your video.
 # Pins are the same full commit SHAs as in ci.yml. Update them on purpose, never by accident.
 name: train-and-gate
@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0   # the gate reads the champion from the previous commit, so it needs history
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -49,16 +49,59 @@ jobs:
           BATCH="${GITHUB_SHA::7}" python -m src.train.train_mlflow
 
       - name: Promotion gate (exit code 1 = blocked)
-        run: python scripts/promote.py --champion-file "$RUNNER_TEMP/champion.json"
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          BASE="${BASE:-HEAD~1}"
+          if [ "${{ github.event_name }}" != "pull_request" ] && git diff --quiet "$BASE" HEAD -- artifacts/champion.json 2>/dev/null; then
+            echo "SKIPPED: artifacts/champion.json did not change, so there is no new model to judge. The committed champion is what gets built."
+            exit 0
+          fi
+          python scripts/promote.py --champion-file "$RUNNER_TEMP/champion.json"
 
       - name: Summary
         if: always()
         run: |
           {
             echo "### Gate"
-            echo "Batch \`${GITHUB_SHA::7}\`. See the step above for PROMOTED or BLOCKED."
-            echo "To record a promotion, commit \`artifacts/champion.json\`, \`artifacts/metadata.json\` and \`artifacts/model.joblib\` from your own run of \`scripts/promote.py\`."
+            echo "Batch \`${GITHUB_SHA::7}\`. See the gate step above for PROMOTED, BLOCKED or SKIPPED."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # TODO (your work): after the gate passes on main, build the image (the Dockerfile packages artifacts/model.joblib),
-      # smoke-test it with scripts/smoke_test.sh, and deploy it. See Part 6 of the lab page for both options.
+  build:
+    name: build, smoke-test and publish the champion image
+    needs: gate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image name and lineage
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "RUN_ID=$(jq -r .mlflow_run_id artifacts/champion.json)" >> "$GITHUB_ENV"
+          echo "MLFLOW_VERSION=$(jq -r .mlflow_model_version artifacts/champion.json)" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          docker build --build-arg GIT_SHA="$GITHUB_SHA" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label mlflow.run_id="$RUN_ID" \
+            -t "$IMAGE" .
+      - name: Smoke test the container
+        run: |
+          docker run -d --name api -p 8000:8000 "$IMAGE"
+          bash scripts/smoke_test.sh http://localhost:8000
+          grep -q "${GITHUB_SHA::7}" /tmp/health.json   # the running model says which commit built it
+      - name: Publish to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE"
+          {
+            echo "### Lineage"
+            echo "| | |"; echo "|---|---|"
+            echo "| Image tag | \`$IMAGE\` |"
+            echo "| Commit SHA | \`$GITHUB_SHA\` |"
+            echo "| MLflow run ID | \`$RUN_ID\` |"
+            echo "| MLflow model version | \`$MLFLOW_VERSION\` |"
+            echo "| /health | \`$(cat /tmp/health.json)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
