@@ -51,9 +51,9 @@ def preprocessing() -> ColumnTransformer:
 # TODO 1: choose at least three candidates and justify them in MODEL_SELECTION.md.
 # Change the settings, not just the names: a different model family or a clearly different setting each time.
 CANDIDATES = {
-    "logreg": LogisticRegression(max_iter=1000),
-    "random_forest": RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42),
-    "gradient_boosting": GradientBoostingClassifier(random_state=42),
+    "logreg_balanced": LogisticRegression(max_iter=1000, class_weight="balanced"),
+    "rf_depth4_leaf10": RandomForestClassifier(n_estimators=200, max_depth=4, min_samples_leaf=10, random_state=42),
+    "gb_50_rounds": GradientBoostingClassifier(n_estimators=50, random_state=42),
 }
 
 
